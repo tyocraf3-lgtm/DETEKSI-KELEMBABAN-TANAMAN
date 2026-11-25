@@ -1,0 +1,168 @@
+#include <WiFi.h>
+#include <MQTT.h>
+
+const char* SKENARIO = "S3";
+const int   PAYLOAD_BYTE = 20;
+const int   QOS = 0;                      // S5/S6: ganti 1
+
+const char* WIFI_SSID = "Wokwi-GUEST";
+const char* WIFI_PASS = "";
+
+const char* MQTT_HOST = "broker.hivemq.com";   // cadangan: broker.emqx.io / test.mosquitto.org
+const int   MQTT_PORT = 1883;                  // tanpa TLS
+const char* TOPIK = "tubes-iot-2311101009/s3/echo";
+
+const int TARGET_PESAN = 100;
+const unsigned long JEDA_KIRIM_MS = 2000;
+const unsigned long TIMEOUT_MS = 5000;
+
+WiFiClient net;
+MQTTClient client(1024);
+
+volatile int seqDiharapkan = 0;
+volatile bool diterima = false;
+volatile unsigned long t_terima_ms = 0;
+
+int seq = 0;
+bool selesai = false;
+unsigned long kirimTerakhir = 0;
+
+String buatPayload(int s) {
+  String p = String(s);
+  while (p.length() < 4) p = "0" + p;     // 4 byte pertama = seq
+  while ((int)p.length() < PAYLOAD_BYTE) p += 'X';
+  return p;
+}
+
+void messageReceived(String &topic, String &payload) {
+  unsigned long t = millis();             // dicatat secepat mungkin
+  if (!diterima && payload.substring(0, 4).toInt() == seqDiharapkan) {
+    t_terima_ms = t;
+    diterima = true;
+  }
+}
+
+bool sambungWiFi() {
+  for (int percobaan = 1; percobaan <= 3; percobaan++) {
+    Serial.printf("# WiFi percobaan %d\n", percobaan);
+    WiFi.disconnect(true);
+    delay(500);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASS, 6);
+    unsigned long mulai = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - mulai < 20000) {
+      delay(500);
+      Serial.print("#");
+    }
+    Serial.println();
+    if (WiFi.status() == WL_CONNECTED) return true;
+  }
+  return false;
+}
+
+bool sambungMqtt() {
+  // Diagnosis: pisahkan masalah DNS, TCP, dan protokol MQTT
+  IPAddress ip;
+  if (WiFi.hostByName(MQTT_HOST, ip)) {
+    Serial.print("# DNS OK: "); Serial.println(ip);
+  } else {
+    Serial.println("# DNS GAGAL");
+  }
+  WiFiClient uji;
+  uji.setTimeout(5);
+  Serial.println(uji.connect(MQTT_HOST, MQTT_PORT) ? "# TCP OK" : "# TCP GAGAL");
+  uji.stop();
+
+  String id = "esp32-" + String(SKENARIO) + "-" + String((uint32_t)ESP.getEfuseMac(), HEX);
+  for (int i = 0; i < 5; i++) {
+    if (client.connect(id.c_str())) {
+      client.subscribe(TOPIK, QOS);
+      Serial.println("# MQTT terhubung");
+      return true;
+    }
+    Serial.printf("# MQTT gagal: lastError=%d returnCode=%d\n",
+                  (int)client.lastError(), (int)client.returnCode());
+    delay(1500);
+  }
+  return false;
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.printf("# %s - MQTT QoS %d - %d byte\n", SKENARIO, QOS, PAYLOAD_BYTE);
+
+  client.begin(MQTT_HOST, MQTT_PORT, net);   // diinisialisasi dulu agar client.loop() aman
+  client.setTimeout(TIMEOUT_MS);
+  client.onMessage(messageReceived);
+
+  if (!sambungWiFi()) {
+    Serial.println("# WiFi GAGAL TERHUBUNG (3x percobaan)");
+    return;
+  }
+  Serial.print("# IP: ");   Serial.println(WiFi.localIP());
+  Serial.print("# RSSI: "); Serial.println(WiFi.RSSI());
+
+  if (!sambungMqtt()) {
+    Serial.println("# MQTT GAGAL TERHUBUNG");
+    return;
+  }
+
+  Serial.println("skenario,seq,payload_byte,t_kirim_ms,t_terima_ms,rtt_ms,status,rssi_dbm");
+  kirimTerakhir = millis() - JEDA_KIRIM_MS;
+}
+
+void loop() {
+  client.loop();
+
+  if (seq >= TARGET_PESAN) {
+    if (!selesai) { Serial.println("# SELESAI"); selesai = true; }
+    return;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("# WiFi terputus, mencoba menyambung ulang");
+    if (sambungWiFi()) sambungMqtt();
+    return;
+  }
+  if (!client.connected()) {
+    Serial.println("# MQTT terputus, reconnect");
+    sambungMqtt();
+    return;
+  }
+  if (millis() - kirimTerakhir < JEDA_KIRIM_MS) return;
+
+  seq++;
+  seqDiharapkan = seq;
+  diterima = false;
+  String payload = buatPayload(seq);
+
+  unsigned long t_kirim_ms = millis();    // tepat sebelum publish
+  kirimTerakhir = t_kirim_ms;
+  bool terkirim = client.publish(TOPIK, payload, false, QOS);
+
+  // tunggu echo dari broker maksimal 5 detik
+  while (terkirim && !diterima && millis() - t_kirim_ms < TIMEOUT_MS) {
+    client.loop();
+    yield();
+  }
+
+  int rssi = WiFi.RSSI();
+  unsigned long rtt_ms = t_terima_ms - t_kirim_ms;
+  bool ok = terkirim && diterima && rtt_ms <= TIMEOUT_MS;
+
+  Serial.print(SKENARIO);       Serial.print(",");
+  Serial.print(seq);            Serial.print(",");
+  Serial.print(PAYLOAD_BYTE);   Serial.print(",");
+  Serial.print(t_kirim_ms);     Serial.print(",");
+  if (ok) {
+    Serial.print(t_terima_ms);  Serial.print(",");
+    Serial.print(rtt_ms);       Serial.print(",Berhasil,");
+  } else {
+    Serial.print(",,Hilang,");
+  }
+  Serial.println(rssi);
+
+  if (!ok) {
+    Serial.print("# seq="); Serial.print(seq);
+    Serial.print(" terkirim="); Serial.println(terkirim);
+  }
+}

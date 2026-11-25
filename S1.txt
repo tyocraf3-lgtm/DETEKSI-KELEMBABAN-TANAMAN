@@ -1,0 +1,99 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+
+const char* SKENARIO = "S1";
+const int   PAYLOAD_BYTE = 20;          // S2: ganti 500 dan SKENARIO "S2"
+
+const char* WIFI_SSID = "Wokwi-GUEST";
+const char* WIFI_PASS = "";
+const char* HTTP_ENDPOINT = "http://httpbin.org/post";
+
+const int TARGET_PESAN = 100;
+const unsigned long JEDA_KIRIM_MS = 2000;
+const unsigned long TIMEOUT_MS = 5000;
+
+int seq = 0;
+bool selesai = false;
+unsigned long kirimTerakhir = 0;
+String payloadData;
+
+void setup() {
+  Serial.begin(115200);
+  for (int i = 0; i < PAYLOAD_BYTE; i++) payloadData += 'X';
+
+  Serial.printf("# %s - HTTP POST - %d byte (len=%d)\n",
+                SKENARIO, PAYLOAD_BYTE, payloadData.length());
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS, 6);
+
+  unsigned long mulai = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - mulai < 20000) {
+    delay(500);
+    Serial.print("#");
+  }
+  Serial.println();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("# WiFi GAGAL TERHUBUNG");
+    return;
+  }
+  Serial.print("# IP: ");   Serial.println(WiFi.localIP());
+  Serial.print("# RSSI: "); Serial.println(WiFi.RSSI());
+
+  Serial.println("skenario,seq,payload_byte,t_kirim_ms,t_terima_ms,rtt_ms,status,rssi_dbm");
+  kirimTerakhir = millis() - JEDA_KIRIM_MS;
+}
+
+void loop() {
+  if (seq >= TARGET_PESAN) {
+    if (!selesai) { Serial.println("# SELESAI"); selesai = true; }
+    return;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("# WiFi terputus");
+    delay(1000);
+    return;
+  }
+  if (millis() - kirimTerakhir < JEDA_KIRIM_MS) return;
+
+  seq++;
+
+  HTTPClient http;
+  http.setReuse(false);                       // koneksi baru tiap pesan
+  http.setConnectTimeout(TIMEOUT_MS);
+  http.setTimeout(TIMEOUT_MS);
+  http.begin(HTTP_ENDPOINT);
+  http.addHeader("Content-Type", "text/plain");
+  http.addHeader("Connection", "close");
+
+  unsigned long t_kirim_ms = millis();        // tepat sebelum request
+  kirimTerakhir = t_kirim_ms;
+
+  int code = http.POST(payloadData);
+  if (code >= 200 && code < 300) http.getString();   // baca body penuh
+
+  unsigned long t_terima_ms = millis();
+  unsigned long rtt_ms = t_terima_ms - t_kirim_ms;
+  int rssi = WiFi.RSSI();
+  http.end();
+
+  bool ok = (code >= 200 && code < 300 && rtt_ms <= TIMEOUT_MS);
+
+  Serial.print(SKENARIO);       Serial.print(",");
+  Serial.print(seq);            Serial.print(",");
+  Serial.print(PAYLOAD_BYTE);   Serial.print(",");
+  Serial.print(t_kirim_ms);     Serial.print(",");
+  if (ok) {
+    Serial.print(t_terima_ms);  Serial.print(",");
+    Serial.print(rtt_ms);       Serial.print(",Berhasil,");
+  } else {
+    Serial.print(",,Hilang,");
+  }
+  Serial.println(rssi);
+
+  if (!ok) {
+    Serial.print("# seq="); Serial.print(seq);
+    Serial.print(" code="); Serial.print(code);
+    Serial.print(" elapsed_ms="); Serial.println(rtt_ms);
+  }
+}
